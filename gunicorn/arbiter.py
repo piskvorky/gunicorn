@@ -39,8 +39,10 @@ class Arbiter(object):
     WORKERS = {}
     PIPE = []
 
+    # Indicator used to signal that the arbiter main thread has work to do
+    WAKE_UP = 0
+
     # I love dynamic languages
-    SIG_QUEUE = []
     SIGNALS = [getattr(signal, "SIG%s" % x)
                for x in "CHLD HUP QUIT INT TERM TTIN TTOU USR1 USR2 WINCH".split()]
     SIG_NAMES = dict(
@@ -187,10 +189,17 @@ class Arbiter(object):
         for s in self.SIGNALS:
             signal.signal(s, self.signal)
 
+    def write_message_to_pipe(self, one_byte_message):
+        try:
+            os.write(self.PIPE[1],
+                     one_byte_message.to_bytes(length=1, byteorder='big'))
+        except IOError as e:
+            if e.errno not in [errno.EAGAIN, errno.EINTR]:
+                raise
+
     def signal(self, sig, frame):
-        if len(self.SIG_QUEUE) < 5:
-            self.SIG_QUEUE.append(sig)
-            self.wakeup()
+        """ Note: Signal context! No logging or memory allocations allowed. """
+        self.write_message_to_pipe(sig)
 
     def run(self):
         "Main master loop."
@@ -203,13 +212,13 @@ class Arbiter(object):
             while True:
                 self.maybe_promote_master()
 
-                sig = self.SIG_QUEUE.pop(0) if self.SIG_QUEUE else None
-                if sig is None:
-                    self.sleep()
+                event_or_signal = self.wait_for_event(timeout_s=1.0)
+                if event_or_signal is None or event_or_signal == self.WAKE_UP:
                     self.murder_workers()
                     self.manage_workers()
                     continue
 
+                sig = event_or_signal
                 if sig not in self.SIG_NAMES:
                     self.log.info("Ignoring unknown signal: %s", sig)
                     continue
@@ -332,11 +341,7 @@ class Arbiter(object):
         """\
         Wake up the arbiter by writing to the PIPE
         """
-        try:
-            os.write(self.PIPE[1], b'.')
-        except IOError as e:
-            if e.errno not in [errno.EAGAIN, errno.EINTR]:
-                raise
+        self.write_message_to_pipe(self.WAKE_UP)
 
     def halt(self, reason=None, exit_status=0):
         """ halt arbiter """
@@ -352,17 +357,14 @@ class Arbiter(object):
         self.cfg.on_exit(self)
         sys.exit(exit_status)
 
-    def sleep(self):
-        """\
-        Sleep until PIPE is readable or we timeout.
-        A readable PIPE means a signal occurred.
-        """
+    def wait_for_event(self, timeout_s):
+        """ Waits until PIPE is readable or we timeout. """
         try:
-            ready = select.select([self.PIPE[0]], [], [], 1.0)
+            ready = select.select([self.PIPE[0]], [], [], timeout_s)
             if not ready[0]:
-                return
-            while os.read(self.PIPE[0], 1):
-                pass
+                return None
+
+            return int.from_bytes(os.read(self.PIPE[0], 1), byteorder='big')
         except (select.error, OSError) as e:
             # TODO: select.error is a subclass of OSError since Python 3.3.
             error_number = getattr(e, 'errno', e.args[0])
@@ -393,11 +395,9 @@ class Arbiter(object):
         # instruct the workers to exit
         self.kill_workers(sig)
         # wait until the graceful timeout
-        while True:
+        while self.WORKERS and time.time() < limit:
+            self.wait_for_event(timeout_s=0.5)
             self.reap_workers()
-            if not self.WORKERS or time.time() >= limit:
-                break
-            time.sleep(0.1)
 
         self.kill_workers(signal.SIGKILL)
 
