@@ -201,6 +201,10 @@ class Arbiter(object):
         """ Note: Signal context! No logging or memory allocations allowed. """
         self.write_message_to_pipe(sig)
 
+        # Some UNIXes require SIGCHLD to be reinstalled, see python signal docs
+        if sig == signal.SIGCHLD:
+            signal.signal(sig, self.signal)
+
     def run(self):
         "Main master loop."
         self.start()
